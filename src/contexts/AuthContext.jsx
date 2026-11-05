@@ -1,0 +1,197 @@
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import client, { setSignOutReason } from '../api/client';
+import useChatStore from '../stores/chatStore';
+import { tearDownPush } from '../lib/pushTeardown';
+import { onPasswordChangeRequired } from '../lib/passwordChange';
+import { rebindPushAfterReset } from '../lib/pwa';
+
+/**
+ * Both sign-outs that stay inside the SPA end up here.
+ *
+ * The third one does not need it: api/client.js tears an expired session down
+ * with `window.location.href`, and a document navigation takes the heap with it.
+ * These two are React Router transitions, so the previous user's threads and
+ * message bodies would otherwise still be in memory when the next person signs
+ * in on the same tab. Call it before setUser(null), so nothing renders from the
+ * old data on the frame the route guard redirects.
+ */
+const dropSessionData = () => {
+  useChatStore.getState().reset();
+};
+
+const AuthContext = createContext(null);
+
+/**
+ * The localStorage mirror of /api/auth/me. It exists only to survive a boot where
+ * the server could not be reached; the httpOnly cookies, not this, decide whether
+ * the session is real, and every request still proves that against the API.
+ */
+const cachedUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null');
+  } catch {
+    return null;
+  }
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
+  return context;
+};
+
+/**
+ * Owns the signed-in user for the whole app: proves the session with /me on
+ * mount, mirrors the user to localStorage, and exposes login, logout and the
+ * setters that move the app onto and off the forced password change (batch 73).
+ */
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  /**
+   * Ask /api/auth/me who is signed in and store the answer. A 401 or 403 ends the
+   * session; any other failure keeps the cached user, so a boot without network
+   * does not sign out a session whose cookies are still good. Re-binds push when
+   * the cache was held at the forced password change and /me now says it is done.
+   */
+  const checkAuth = useCallback(async () => {
+    try {
+      // Held at the forced password change when this tab last knew (batch 73)?
+      const wasHeld = cachedUser()?.must_change_password === true;
+      // Session lives in httpOnly cookies; /me is the source of truth.
+      const { data } = await client.get('/api/auth/me');
+      // Released since, so the password was changed: by this tab before a reload
+      // (the forced screen asks for one when the server's confirmation was lost)
+      // or by another. The reset deleted this account's push rows while the
+      // browser kept its subscription, and the heal that runs next never re-sends
+      // one the browser still holds, so push would stay dead with Settings showing
+      // it on. Re-bound here as the forced screen does; not awaited (batch 73
+      // review).
+      if (wasHeld && data?.must_change_password === false) rebindPushAfterReset();
+      setUser(data);
+      localStorage.setItem('user', JSON.stringify(data));
+    } catch (err) {
+      // Tell "the server says this session is finished" apart from "we could not
+      // ask". Every failure used to clear the cache and drop to the login screen,
+      // so a boot with no network signed out a user whose cookies were still
+      // good. client.js has already tried refresh-and-replay by the time we get
+      // here, so a 401/403 is terminal; anything else is a transport failure and
+      // the cached user stands until a request can actually reach the server.
+      const status = err.response?.status;
+      if (status === 401 || status === 403) {
+        localStorage.removeItem('user');
+        dropSessionData();
+        // Same reason as logout(), minus the API call: this session is already
+        // refused, so a DELETE would 401 and re-enter the refresh interceptor for
+        // a session that is over. Unsubscribing the browser is the half that
+        // stops delivery anyway — the abandoned endpoint then answers 404/410 and
+        // services/push.py prunes the row on the next send.
+        await tearDownPush({ nav: navigator, storage: localStorage });
+        // This path is a SOFT sign-out — the route guards render
+        // <Navigate to="/login">, a React transition rather than a document
+        // navigation — so unlike client.js the message could have lived in
+        // state. It uses the same channel anyway so there is one way to say
+        // this, and so Login needs only one reader.
+        setSignOutReason('expired');
+        setUser(null);
+      } else {
+        setUser(cachedUser());
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+
+  /**
+   * Replace the signed-in user, keeping the localStorage mirror in step.
+   *
+   * The two have to move together: websocket.js reads the session's id from the
+   * mirror, and an offline boot restores from it — so a flag set in state alone
+   * would be forgotten by the next boot that could not reach /me, and that boot
+   * would render the app the server is refusing.
+   */
+  const updateUser = useCallback((next) => {
+    localStorage.setItem('user', JSON.stringify(next));
+    setUser(next);
+  }, []);
+
+  /**
+   * Set or clear the pending password change (batch 73) on the current user.
+   *
+   * App.jsx gates the whole session on `user.must_change_password`, so this is
+   * how the app enters and leaves the forced change-password screen. A no-op
+   * with nobody signed in, and when the flag already has that value — every
+   * refused request announces, so a screen that fired five at once calls this
+   * five times, and only the first may cost a render.
+   *
+   * The updater stays pure; the localStorage mirror is written by the effect
+   * below, from the value React actually committed (CodeRabbit, review of
+   * 70495a4).
+   */
+  const setMustChangePassword = useCallback((required) => {
+    setUser((prev) => (
+      !prev || Boolean(prev.must_change_password) === required
+        ? prev
+        : { ...prev, must_change_password: required }
+    ));
+  }, []);
+
+  // The mirror follows the committed user, so whatever changed it — above all the
+  // flag, which an offline boot must not forget — is what the next boot restores.
+  // Signing out removes the mirror itself; a null user writes nothing here.
+  useEffect(() => {
+    if (user) localStorage.setItem('user', JSON.stringify(user));
+  }, [user]);
+
+  // The API refusing this session until its password is changed, whoever saw it
+  // first: the axios interceptor for a 403 carrying PASSWORD_CHANGE_REQUIRED, or
+  // the socket for a 4403 close. Neither signs anybody out; both land here.
+  useEffect(() => onPasswordChangeRequired(() => setMustChangePassword(true)), [setMustChangePassword]);
+
+  const login = async (email, password) => {
+    const { data } = await client.post('/api/auth/login', { email, password });
+    // Belt as well as braces. Signing out clears this, so by here it is normally
+    // already empty — but that makes the guarantee "every sign-out remembered to
+    // clean up", and this makes it "a session always starts empty", which does
+    // not depend on having found every way a session can end.
+    dropSessionData();
+    localStorage.setItem('user', JSON.stringify(data.user));
+    setUser(data.user);
+    return data.user;
+  };
+
+  const logout = async () => {
+    // Before the logout POST, not after: DELETE /api/notifications/subscribe
+    // authenticates as this user, and the POST below is what clears the cookies
+    // it needs. Awaited rather than fired off, because the whole point is that it
+    // finishes while the session still exists.
+    //
+    // Without this the browser stayed subscribed and the push_subscriptions row
+    // stayed bound to the user signing out, so every message sent to them went on
+    // arriving as an OS notification on this machine — sender's name in the title
+    // and 120 characters of the message body (services/messaging.py:_push_preview)
+    // — to whoever used it next, on the lock screen included. The heap teardown
+    // below never covered it: a push notification is delivered by the service
+    // worker, which outlives the tab.
+    await tearDownPush({ nav: navigator, api: client, storage: localStorage });
+    try {
+      await client.post('/api/auth/logout');
+    } catch {
+      // ignore — cookies are cleared server-side; local state resets regardless
+    }
+    localStorage.removeItem('user');
+    dropSessionData();
+    setUser(null);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, loading, login, logout, checkAuth, updateUser, setMustChangePassword }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};

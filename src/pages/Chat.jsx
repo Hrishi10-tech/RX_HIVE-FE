@@ -1,0 +1,295 @@
+import { useState, useEffect, useCallback } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ChatSidebar } from '../components/chat/ChatSidebar';
+import { ChatPanel } from '../components/chat/ChatPanel';
+import { ChatErrorBoundary } from '../components/shared/ErrorBoundary';
+import { toast } from 'sonner';
+import useChatStore from '../stores/chatStore';
+import { enablePushNotifications } from '../lib/pwa';
+
+export default function Chat() {
+  // Narrow selectors. This component renders the whole chat surface, so
+  // subscribing to the entire store re-mounted-through-rendered both panes on
+  // every message, receipt, presence ping and keystroke-driven typing event.
+  // The unread total is selected as a number, not the conversations array, so
+  // the title effect only reruns when the number actually changes.
+  const activeConversationId = useChatStore(s => s.activeConversationId);
+  const setActiveConversation = useChatStore(s => s.setActiveConversation);
+  const totalUnread = useChatStore(
+    s => s.conversations.reduce((sum, c) => sum + (c.unread_count || 0), 0)
+  );
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [showMessages, setShowMessages] = useState(false);
+  const [notifAsked, setNotifAsked] = useState(false);
+
+  // The realtime socket is NOT owned here any more — see
+  // components/shared/RealtimeSession.jsx, mounted in App.jsx outside <Routes>.
+  // Tying it to this page tied it to the route: navigating away disconnected
+  // with _intentionalClose set, which suppresses reconnection, and connect()
+  // was called from nowhere else. The user went silently offline until they
+  // came back. The call-state guard moved with it.
+
+  // FIX: iOS virtual keyboard viewport lock
+  useEffect(() => {
+    if (window.visualViewport) {
+      const handleResize = () => {
+        const vh = window.visualViewport.height;
+        document.documentElement.style.setProperty('--vh', `${vh}px`);
+        window.scrollTo(0, 0);
+      };
+      const handleScroll = () => { window.scrollTo(0, 0); };
+      window.visualViewport.addEventListener('resize', handleResize);
+      window.visualViewport.addEventListener('scroll', handleScroll);
+      handleResize();
+      return () => {
+        window.visualViewport.removeEventListener('resize', handleResize);
+        window.visualViewport.removeEventListener('scroll', handleScroll);
+      };
+    }
+  }, []);
+
+  // FIX: Prevent touchmove scroll on everything except scrollable areas
+  useEffect(() => {
+    const preventScroll = (e) => {
+      let target = e.target;
+      while (target && target !== document.body) {
+        if (target.classList.contains('scrollable-area')) return;
+        target = target.parentElement;
+      }
+      e.preventDefault();
+    };
+    document.addEventListener('touchmove', preventScroll, { passive: false });
+    return () => document.removeEventListener('touchmove', preventScroll);
+  }, []);
+
+  // Browser notification permission
+  useEffect(() => {
+    if (notifAsked || typeof Notification === 'undefined') return;
+    const asked = localStorage.getItem('rxhive_notif_asked');
+    if (asked) { setNotifAsked(true); return; }
+    // Show in-app banner after 2s
+    const timer = setTimeout(() => {
+      if (Notification.permission === 'default') {
+        setNotifAsked(false); // Will show banner
+      } else {
+        setNotifAsked(true);
+      }
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [notifAsked]);
+
+  /**
+   * The banner's Enable, which used to request the OS permission and stop there.
+   *
+   * That is the same inert path Settings.jsx was moved off: permission alone
+   * creates no PushSubscription row, so services/push.py had nothing to send to
+   * and push_to_users short-circuited on an empty subscription set. The banner
+   * vanished, the permission was granted, and the user had every reason to think
+   * notifications were on while receiving none — including, per
+   * services/calls.py:_dispatch_call_push, no ring at all for a call arriving
+   * while their socket is down, which is the one case push exists to cover.
+   *
+   * enablePushNotifications() requests the permission itself as its first act, so
+   * calling it straight from the click keeps that inside the user gesture —
+   * Safari rejects Notification.requestPermission() outside one.
+   */
+  const handleEnableNotifications = async () => {
+    // Dismissed up front and regardless of the outcome: a banner that returns
+    // while the permission prompt is still open is worse than one the user has to
+    // re-find in Settings, and a denial is not something to keep asking about.
+    localStorage.setItem('rxhive_notif_asked', 'true');
+    setNotifAsked(true);
+    try {
+      await enablePushNotifications();
+      // Settings reads this back as the state of its own toggle. Written on
+      // success only, so a failed subscribe does not leave the switch claiming
+      // one exists.
+      localStorage.setItem('rxhive_desktop_notif', 'true');
+      toast.success('Notifications enabled');
+    } catch (err) {
+      // Each message is separately actionable — permission denied, unsupported
+      // browser, VAPID not provisioned server-side — so it is shown verbatim,
+      // matching the Settings toggle. Silence here is what let a denial read as
+      // success.
+      toast.error(err?.message || 'Could not enable notifications');
+    }
+  };
+
+  const handleDismissNotifications = () => {
+    localStorage.setItem('rxhive_notif_asked', 'true');
+    setNotifAsked(true);
+  };
+
+  // Update document title with unread count
+  useEffect(() => {
+    document.title = totalUnread > 0 ? `RxHive (${totalUnread})` : 'RxHive';
+    // OS-level badge (installed PWA / macOS dock / Android launcher). Guarded:
+    // unsupported on Firefox and older Safari, and setAppBadge rejects rather
+    // than throwing synchronously.
+    if ('setAppBadge' in navigator) {
+      const p = totalUnread > 0 ? navigator.setAppBadge(totalUnread) : navigator.clearAppBadge();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
+  }, [totalUnread]);
+
+  // A notification click cannot open the right chat by URL alone when it just
+  // focuses an existing tab, so sw.js postMessages the conversation id instead.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return undefined;
+    const onMessage = (event) => {
+      if (event.data?.type !== 'rxhive:open-conversation') return;
+      const convId = event.data.convId;
+      if (convId) setActiveConversation(convId);
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+  }, [setActiveConversation]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Ctrl+K / Cmd+K -> Focus search
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        const searchInput = document.querySelector('[data-testid="conversation-search"]');
+        if (searchInput) searchInput.focus();
+      }
+      // Ctrl+N / Cmd+N -> New chat
+      if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
+        e.preventDefault();
+        const newChatBtn = document.querySelector('[data-testid="new-chat-button"]');
+        if (newChatBtn) newChatBtn.click();
+      }
+      // Escape -> Close modals/search
+      if (e.key === 'Escape') {
+        // Let individual components handle Escape
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobile(mobile);
+      if (!mobile) setShowMessages(false);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Stable: these reach every conversation row through the sidebar, so a fresh
+  // identity per render defeats the rows' memoisation.
+  const handleSelectConversation = useCallback((convId) => {
+    setActiveConversation(convId);
+    if (isMobile) setShowMessages(true);
+  }, [setActiveConversation, isMobile]);
+
+  const handleBack = useCallback(() => {
+    setShowMessages(false);
+    setActiveConversation(null);
+  }, [setActiveConversation]);
+
+  const showNotifBanner = !notifAsked && typeof Notification !== 'undefined' && Notification.permission === 'default' && !localStorage.getItem('rxhive_notif_asked');
+
+  return (
+    <div className="h-screen h-[100dvh] bg-[#0A0A0A] flex flex-col overflow-hidden">
+      {/* Notification Permission Banner */}
+      {showNotifBanner && (
+        <div className="bg-[#141414] border-b border-[#1F1F1F] px-4 py-2 flex items-center justify-center gap-4 text-sm flex-shrink-0">
+          <span className="text-[#A3A3A3]">Enable notifications to stay updated on new messages</span>
+          <button onClick={handleEnableNotifications}
+            className="px-3 py-1 bg-[#10B981] text-[#0A0A0A] rounded-[6px] text-xs font-medium hover:bg-[#059669] transition-colors">
+            Enable
+          </button>
+          <button onClick={handleDismissNotifications}
+            className="px-3 py-1 text-[#A3A3A3] hover:text-[#F5F5F5] text-xs transition-colors">
+            Not now
+          </button>
+        </div>
+      )}
+
+      {/* Main Chat Layout */}
+      <div className="flex-1 flex overflow-hidden min-h-0">
+        {isMobile ? (
+          <AnimatePresence mode="wait">
+            {showMessages && activeConversationId ? (
+              <motion.div
+                key="messages"
+                initial={{ x: '100%' }}
+                animate={{ x: 0 }}
+                exit={{ x: '100%' }}
+                transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
+                className="w-full h-full"
+              >
+                {/* Inside the motion.div, not around it: AnimatePresence needs
+                    the keyed motion.div as its direct child or the slide breaks.
+                    The desktop branch below has always had this boundary; the
+                    mobile branch did not, so on a phone any render throw in the
+                    chat pane escaped to the root and blanked the whole app
+                    instead of the one pane. */}
+                {/* onBack on the boundary too, not just the panel: this
+                    fallback is the whole phone screen, and ChatPanel's own back
+                    button is gone with the panel that threw. Without it, a
+                    deterministic error leaves Try again as the only control,
+                    showMessages stuck true, and no route back to the sidebar. */}
+                {/* resetKey because the motion.div's key is the constant
+                    "messages": the boundary survives a conversation change, so
+                    without this a stuck fallback carries over to the next chat.
+                    Reachable here without any click — the service-worker
+                    handler above sets activeConversationId from a notification
+                    while showMessages stays true. */}
+                <ChatErrorBoundary onBack={handleBack} resetKey={activeConversationId}>
+                  <ChatPanel
+                    conversationId={activeConversationId}
+                    onBack={handleBack}
+                    isMobile={true}
+                  />
+                </ChatErrorBoundary>
+              </motion.div>
+            ) : (
+              <motion.div
+                key="sidebar"
+                initial={{ x: '-100%' }}
+                animate={{ x: 0 }}
+                exit={{ x: '-100%' }}
+                transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
+                className="w-full h-full"
+              >
+                <ChatErrorBoundary>
+                  <ChatSidebar
+                    onSelectConversation={handleSelectConversation}
+                    isMobile={true}
+                  />
+                </ChatErrorBoundary>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        ) : (
+          <>
+            <div className="w-[300px] lg:w-[360px] flex-shrink-0 h-full">
+              <ChatErrorBoundary>
+                <ChatSidebar
+                  onSelectConversation={handleSelectConversation}
+                  isMobile={false}
+                />
+              </ChatErrorBoundary>
+            </div>
+            {/* Same defect, wider trigger: this boundary is never remounted at
+                all, so every sidebar click changes activeConversationId in
+                place and a stuck fallback outlives all of them. No onBack —
+                the sidebar stays visible here, so there is already a way out. */}
+            <ChatErrorBoundary resetKey={activeConversationId}>
+              <ChatPanel
+                conversationId={activeConversationId}
+                onBack={handleBack}
+                isMobile={false}
+              />
+            </ChatErrorBoundary>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

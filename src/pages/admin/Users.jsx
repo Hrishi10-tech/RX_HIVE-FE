@@ -1,0 +1,1060 @@
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Plus, Search, Pencil, Users as UsersIcon, Loader2,
+  ChevronLeft, ChevronRight, ChevronDown, Copy, RefreshCw, X,
+  Smartphone
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { PageTransition } from '../../components/common/PageTransition';
+import client from '../../api/client';
+
+import { generatePassword } from '../../utils/generatePassword';
+import { createRequestTicket } from '../../utils/latestRequest';
+import { apiError } from '../../utils/helpers';
+
+/**
+ * The superadmin portal's user list across every organization: org, department,
+ * status and mobile-access filters, search and paging, with the create form and
+ * the edit drawer that holds Reset Password.
+ */
+export default function UsersPage() {
+  const [orgs, setOrgs] = useState([]);
+  const [depts, setDepts] = useState([]);
+  const [selectedOrg, setSelectedOrg] = useState(null);
+  const [selectedDept, setSelectedDept] = useState(null);
+  const [orgDropdownOpen, setOrgDropdownOpen] = useState(false);
+  const [deptDropdownOpen, setDeptDropdownOpen] = useState(false);
+  const [statusFilter, setStatusFilter] = useState(null);
+  // null = all, 'granted' | 'denied' — "who can actually use the phone app?"
+  const [mobileFilter, setMobileFilter] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const limit = 10;
+
+  // Selection
+  const [selectedIds, setSelectedIds] = useState([]);
+
+  // Modals
+  const [showCreate, setShowCreate] = useState(false);
+  const [editUser, setEditUser] = useState(null);
+  const [resetPwResult, setResetPwResult] = useState(null);
+
+  // Create form
+  const [createOrg, setCreateOrg] = useState(null);
+  const [createOrgOpen, setCreateOrgOpen] = useState(false);
+  const [createDepts, setCreateDepts] = useState([]);
+  const [createDept, setCreateDept] = useState(null);
+  const [createDeptOpen, setCreateDeptOpen] = useState(false);
+  const [createEmail, setCreateEmail] = useState('');
+  const [createName, setCreateName] = useState('');
+  const [createPassword, setCreatePassword] = useState('');
+  const [createRole, setCreateRole] = useState('member');
+  const [createMobileAccess, setCreateMobileAccess] = useState(false);
+  const [autoPassword, setAutoPassword] = useState(true);
+  const [emailAvailable, setEmailAvailable] = useState(null);
+  const [createSaving, setCreateSaving] = useState(false);
+
+  // Edit form
+  const [editName, setEditName] = useState('');
+  const [editRole, setEditRole] = useState('member');
+  const [editActive, setEditActive] = useState(true);
+  const [editMobileAccess, setEditMobileAccess] = useState(false);
+  const [editDeptId, setEditDeptId] = useState(null);
+  const [editDepts, setEditDepts] = useState([]);
+  const [editDeptOpen, setEditDeptOpen] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+
+  // Ids with an in-flight inline mobile-access toggle, so the row can show a
+  // spinner and refuse a second click without blocking the rest of the table.
+  const [mobilePending, setMobilePending] = useState([]);
+
+  // Load orgs
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await client.get('/api/admin/organizations', { params: { limit: 100 } });
+        setOrgs(data.data);
+      } catch { toast.error('Failed to load organizations'); }
+    })();
+  }, []);
+
+  // Load depts for filter
+  useEffect(() => {
+    if (!selectedOrg) { setDepts([]); return; }
+    (async () => {
+      try {
+        const { data } = await client.get('/api/admin/departments', { params: { org_id: selectedOrg._id, limit: 100 } });
+        setDepts(data.data);
+      } catch { setDepts([]); }
+    })();
+  }, [selectedOrg]);
+
+  // One counter for every load below, effect-driven and imperative alike.
+  // The scheme the comment beneath describes now lives in utils/latestRequest,
+  // shared with the three sibling admin lists that were missing it entirely.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadUsers = useCallback(() => setReloadNonce((n) => n + 1), []);
+
+  /**
+   * One list load. Each takes a ticket from `ticketRef` and only the holder
+   * of the newest may write — the same request-token scheme the window fetches
+   * in ChatPanel use.
+   *
+   * Every keystroke in the search box rewrites `search`, which rebuilds this
+   * callback and re-runs the effect below, so several loads are in flight at
+   * once — and nothing makes them come back in the order they were sent. A
+   * two-character prefix matching thousands of rows is slower to answer than
+   * the five-character one typed after it, so without this guard whichever
+   * response lands LAST wins: the table and the "of N" total settle on a query
+   * the search box no longer contains, and stay wrong until the next keystroke.
+   *
+   * A flag scoped to one effect run could not cover that, because it only ever
+   * disowned the run that created it. The refreshes fired after create, edit
+   * and bulk actions call this imperatively, outside any effect, so they held
+   * no flag and counted as current unconditionally: one still in flight when a
+   * filter change or a keystroke started a newer load would land second and
+   * overwrite that newer result with its own differently-filtered rows. It
+   * failed in the other direction too — starting an imperative refresh did not
+   * supersede an effect load already in flight, so a slow pre-create response
+   * could land after the refresh and drop the row just created back out of the
+   * table. One shared counter orders all four call sites against each other.
+   */
+  const fetchUsers = useCallback(async () => {
+    const seq = ticketRef.current.take();
+    setLoading(true);
+    try {
+      const params = { page, limit, search };
+      if (selectedOrg) params.org_id = selectedOrg._id;
+      if (selectedDept) params.dept_id = selectedDept._id;
+      if (statusFilter) params.status = statusFilter;
+      if (mobileFilter) params.mobile = mobileFilter;
+      const { data } = await client.get('/api/admin/users', { params });
+      if (!ticketRef.current.isCurrent(seq)) return;
+      setUsers(data.data);
+      setTotal(data.total);
+    } catch {
+      // A superseded load's failure is not this screen's failure any more:
+      // toasting it would report an error against a query nobody is looking at.
+      if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load users');
+    } finally {
+      // Guarded too, or a slow superseded response would clear the spinner
+      // while the load the user IS waiting for is still in flight.
+      if (ticketRef.current.isCurrent(seq)) setLoading(false);
+    }
+  }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
+
+  useEffect(() => {
+    fetchUsers();
+    // Bumping on the way out keeps what the per-run flag did on unmount: a
+    // response arriving for a screen that is gone writes nothing.
+    return () => ticketRef.current.invalidate();
+  }, [fetchUsers, reloadNonce]);
+
+  // Load create depts when org changes
+  useEffect(() => {
+    if (!createOrg) { setCreateDepts([]); return; }
+    (async () => {
+      try {
+        const { data } = await client.get('/api/admin/departments', { params: { org_id: createOrg._id, limit: 100 } });
+        setCreateDepts(data.data);
+      } catch { setCreateDepts([]); }
+    })();
+  }, [createOrg]);
+
+  // Email validation
+  useEffect(() => {
+    if (!createEmail || !createEmail.includes('@')) { setEmailAvailable(null); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const { data } = await client.get('/api/admin/validate/user-email', { params: { email: createEmail } });
+        setEmailAvailable(data.available);
+      } catch { setEmailAvailable(null); }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [createEmail]);
+
+  // Auto generate password
+  useEffect(() => {
+    if (autoPassword && showCreate) setCreatePassword(generatePassword());
+  }, [autoPassword, showCreate]);
+
+  // Load edit depts
+  useEffect(() => {
+    if (!editUser) return;
+    (async () => {
+      try {
+        const { data } = await client.get('/api/admin/departments', { params: { org_id: editUser.org_id, limit: 100 } });
+        setEditDepts(data.data);
+      } catch { setEditDepts([]); }
+    })();
+  }, [editUser]);
+
+  const openCreate = () => {
+    setCreateOrg(selectedOrg);
+    setCreateDept(null);
+    setCreateEmail('');
+    setCreateName('');
+    setCreateRole('member');
+    setCreateMobileAccess(false);
+    setAutoPassword(true);
+    setCreatePassword(generatePassword());
+    setEmailAvailable(null);
+    setShowCreate(true);
+  };
+
+  const openEdit = (user) => {
+    setEditUser(user);
+    setEditName(user.display_name);
+    setEditRole(user.role);
+    setEditActive(user.is_active);
+    setEditMobileAccess(!!user.mobile_access);
+    setEditDeptId(user.dept_id);
+  };
+
+  const handleCreateUser = async () => {
+    if (!createOrg || !createDept || !createEmail || !createPassword) return;
+    // Mirror UpdateUser/CreateUser's `min_length=2` on display_name. Not
+    // `minLength` on the input: nothing here is inside a <form>, so the browser
+    // never runs constraint validation and the attribute would be pure
+    // decoration. `maxLength` on the input IS live-enforced, so the 100-char
+    // ceiling is expressed there and only the floor is checked here.
+    if (createName.trim().length < 2) return;
+    setCreateSaving(true);
+    try {
+      await client.post('/api/admin/users', {
+        org_id: createOrg._id,
+        dept_id: createDept._id,
+        email: createEmail,
+        display_name: createName,
+        password: createPassword,
+        role: createRole,
+        mobile_access: createMobileAccess,
+      });
+      toast.success('User created successfully', {
+        description: `Password: ${createPassword}`,
+        duration: 10000,
+        action: {
+          label: 'Copy',
+          onClick: () => { navigator.clipboard.writeText(createPassword); toast.success('Password copied!'); }
+        }
+      });
+      setShowCreate(false);
+      reloadUsers();
+    } catch (err) {
+      toast.error(apiError(err, 'Failed to create user'));
+    } finally {
+      setCreateSaving(false);
+    }
+  };
+
+  const handleEditSave = async () => {
+    if (!editUser) return;
+    setEditSaving(true);
+    try {
+      const payload = {
+        display_name: editName,
+        role: editRole,
+        is_active: editActive,
+        mobile_access: editMobileAccess,
+      };
+      if (editDeptId !== editUser.dept_id) payload.dept_id = editDeptId;
+      await client.put(`/api/admin/users/${editUser._id}`, payload);
+      toast.success('User updated');
+      setEditUser(null);
+      reloadUsers();
+    } catch (err) {
+      toast.error(apiError(err, 'Failed to update user'));
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  /**
+   * Reset the edited user's password to a server-generated temporary one, show
+   * it in the drawer and in a toast with a Copy action, and tell the admin the
+   * user must replace it at their next sign-in (batch 73).
+   */
+  const handleResetPassword = async () => {
+    if (!editUser) return;
+    try {
+      const { data } = await client.post(`/api/admin/users/${editUser._id}/reset-password`);
+      setResetPwResult(data.temporary_password);
+      // Says what happens next as well as what the password is (batch 73): the
+      // account is now refused everywhere until its owner replaces this, so an
+      // admin who thought they had simply set a new password would be fielding
+      // "the app won't let me in" without knowing why.
+      toast.success('Password reset successfully', {
+        description: `Temporary password: ${data.temporary_password}. They will be asked to choose a new password the next time they sign in.`,
+        duration: 10000,
+        action: {
+          label: 'Copy',
+          onClick: () => { navigator.clipboard.writeText(data.temporary_password); toast.success('Password copied!'); }
+        }
+      });
+    } catch {
+      toast.error('Failed to reset password');
+    }
+  };
+
+  /**
+   * Grant/revoke one user's mobile sign-in straight from the table row.
+   *
+   * Approving a rollout means walking a list and saying yes to most of it, so the
+   * decision lives one click from the row rather than three clicks deep in the
+   * edit drawer. Optimistic: the pill flips immediately and is put back if the
+   * request fails, because the round trip is long enough that an un-flipped
+   * toggle reads as a dead button and invites a second click.
+   */
+  const toggleMobileAccess = async (user) => {
+    if (mobilePending.includes(user._id)) return;
+    const next = !user.mobile_access;
+    setMobilePending(prev => [...prev, user._id]);
+    setUsers(prev => prev.map(u => (u._id === user._id ? { ...u, mobile_access: next } : u)));
+    try {
+      await client.put(`/api/admin/users/${user._id}`, { mobile_access: next });
+      toast.success(
+        next
+          ? `Mobile access granted to ${user.display_name}`
+          : `Mobile access revoked for ${user.display_name}`
+      );
+      // Keep the edit drawer in sync if it happens to be open on this user.
+      if (editUser?._id === user._id) setEditMobileAccess(next);
+    } catch (err) {
+      setUsers(prev => prev.map(u => (u._id === user._id ? { ...u, mobile_access: !next } : u)));
+      toast.error(apiError(err, 'Failed to update mobile access'));
+    } finally {
+      setMobilePending(prev => prev.filter(id => id !== user._id));
+    }
+  };
+
+  const handleBulkAction = async (action) => {
+    if (selectedIds.length === 0) return;
+    try {
+      const { data } = await client.post('/api/admin/users/bulk-action', {
+        user_ids: selectedIds,
+        action,
+      });
+      toast.success(data.message);
+      setSelectedIds([]);
+      reloadUsers();
+    } catch (err) {
+      toast.error(apiError(err, 'Bulk action failed'));
+    }
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.length === users.length) {
+      setSelectedIds([]);
+    } else {
+      setSelectedIds(users.map(u => u._id));
+    }
+  };
+
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text);
+    toast.success('Copied to clipboard!');
+  };
+
+  const totalPages = Math.ceil(total / limit);
+
+  return (
+    <PageTransition>
+      <div className="max-w-[1400px] mx-auto">
+        {/* Filters */}
+        <div className="flex flex-wrap items-end gap-4 mb-6">
+          {/* Org filter */}
+          <div>
+            <span id="users-01-organization" className="text-xs text-[#A3A3A3] mb-1.5 block">Organization</span>
+            <div className="relative">
+              {/* Caption plus the value it currently holds. Pointing the button
+                  at the caption alone announced "Organization" and swallowed
+                  the filter that is actually applied. */}
+              <button aria-labelledby="users-01-organization users-01-organization-value"
+                aria-expanded={orgDropdownOpen}
+                onClick={() => { setOrgDropdownOpen(!orgDropdownOpen); setDeptDropdownOpen(false); }}
+                data-testid="users-org-filter"
+                className="w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all duration-200"
+              >
+                <span id="users-01-organization-value" className={selectedOrg ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
+                  {selectedOrg?.name || 'All'}
+                </span>
+                <ChevronDown size={14} className="text-[#A3A3A3] flex-shrink-0" />
+              </button>
+              <AnimatePresence>
+                {orgDropdownOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }}
+                    className="absolute top-full left-0 right-0 mt-1 bg-[#141414] border border-[#1F1F1F] rounded-[6px] shadow-lg z-20 max-h-60 overflow-y-auto"
+                  >
+                    <button onClick={() => { setSelectedOrg(null); setSelectedDept(null); setOrgDropdownOpen(false); setPage(1); }}
+                      className="w-full px-4 py-2.5 text-sm text-left text-[#A3A3A3] hover:bg-[#1A1A1A]">All Organizations</button>
+                    {orgs.map(o => (
+                      <button key={o._id} onClick={() => { setSelectedOrg(o); setSelectedDept(null); setOrgDropdownOpen(false); setPage(1); }}
+                        className={`w-full px-4 py-2.5 text-sm text-left hover:bg-[#1A1A1A] ${selectedOrg?._id === o._id ? 'text-[#10B981] bg-[#10B981]/5' : 'text-[#F5F5F5]'}`}>
+                        {o.name}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* Dept filter */}
+          <div>
+            <span id="users-02-department" className="text-xs text-[#A3A3A3] mb-1.5 block">Department</span>
+            <div className="relative">
+              <button aria-labelledby="users-02-department users-02-department-value"
+                aria-expanded={deptDropdownOpen}
+                onClick={() => { if (selectedOrg) { setDeptDropdownOpen(!deptDropdownOpen); setOrgDropdownOpen(false); } }}
+                data-testid="users-dept-filter"
+                className={`w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all duration-200 ${!selectedOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}
+              >
+                <span id="users-02-department-value" className={selectedDept ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
+                  {selectedDept?.name || 'All'}
+                </span>
+                <ChevronDown size={14} className="text-[#A3A3A3] flex-shrink-0" />
+              </button>
+              <AnimatePresence>
+                {deptDropdownOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }}
+                    className="absolute top-full left-0 right-0 mt-1 bg-[#141414] border border-[#1F1F1F] rounded-[6px] shadow-lg z-20 max-h-60 overflow-y-auto"
+                  >
+                    <button onClick={() => { setSelectedDept(null); setDeptDropdownOpen(false); setPage(1); }}
+                      className="w-full px-4 py-2.5 text-sm text-left text-[#A3A3A3] hover:bg-[#1A1A1A]">All Departments</button>
+                    {depts.map(d => (
+                      <button key={d._id} onClick={() => { setSelectedDept(d); setDeptDropdownOpen(false); setPage(1); }}
+                        className={`w-full px-4 py-2.5 text-sm text-left hover:bg-[#1A1A1A] ${selectedDept?._id === d._id ? 'text-[#10B981] bg-[#10B981]/5' : 'text-[#F5F5F5]'}`}>
+                        {d.name}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* Search */}
+          <div>
+            <label htmlFor="users-03-search" className="text-xs text-[#A3A3A3] mb-1.5 block">Search</label>
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A3A3A3]" />
+              <input id="users-03-search"
+                type="text" placeholder="Name or email..."
+                value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                data-testid="users-search-input"
+                className="w-56 h-10 pl-9 pr-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3] focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all duration-200"
+              />
+            </div>
+          </div>
+
+          {/* Status filter */}
+          <div>
+            <span id="users-04-status" className="text-xs text-[#A3A3A3] mb-1.5 block">Status</span>
+            <div role="group" aria-labelledby="users-04-status" className="flex gap-1">
+              {[null, 'active', 'inactive'].map(s => (
+                <button key={s || 'all'} aria-pressed={statusFilter === s} onClick={() => { setStatusFilter(s); setPage(1); }}
+                  className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors ${statusFilter === s ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
+                  {s ? s.charAt(0).toUpperCase() + s.slice(1) : 'All'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Mobile-access filter */}
+          <div>
+            <span id="users-filter-mobile-app" className="text-xs text-[#A3A3A3] mb-1.5 block">Mobile App</span>
+            <div role="group" aria-labelledby="users-filter-mobile-app" className="flex gap-1">
+              {[
+                { value: null, label: 'All' },
+                { value: 'granted', label: 'Approved' },
+                { value: 'denied', label: 'Not approved' },
+              ].map(opt => (
+                <button key={opt.value || 'all'}
+                  aria-pressed={mobileFilter === opt.value}
+                  onClick={() => { setMobileFilter(opt.value); setPage(1); }}
+                  data-testid={`users-mobile-filter-${opt.value || 'all'}`}
+                  className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors whitespace-nowrap ${mobileFilter === opt.value ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="ml-auto">
+            <button onClick={openCreate} data-testid="users-create-button"
+              className="flex items-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium border border-[#10B981] text-[#10B981] hover:bg-[#10B981] hover:text-[#0A0A0A] transition-all duration-200 active:scale-[0.98]">
+              <Plus size={16} /> Create User
+            </button>
+          </div>
+        </div>
+
+        {/* Bulk actions bar */}
+        <AnimatePresence>
+          {selectedIds.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
+              data-testid="users-bulk-actions-bar"
+              className="mb-4 p-3 bg-[#141414] border border-[#10B981]/30 rounded-[8px] flex items-center gap-3"
+            >
+              <span className="text-sm text-[#F5F5F5]">{selectedIds.length} selected</span>
+              <button onClick={() => handleBulkAction('deactivate')}
+                className="px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#EF4444]/10 text-[#EF4444] hover:bg-[#EF4444]/20 transition-colors">
+                Deactivate Selected
+              </button>
+              <button onClick={() => handleBulkAction('activate')}
+                className="px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#10B981]/10 text-[#10B981] hover:bg-[#10B981]/20 transition-colors">
+                Activate Selected
+              </button>
+              <div className="w-px h-5 bg-[#2D2D2D]" />
+              <button onClick={() => handleBulkAction('grant_mobile')}
+                data-testid="users-bulk-grant-mobile"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#10B981]/10 text-[#10B981] hover:bg-[#10B981]/20 transition-colors">
+                <Smartphone size={12} /> Grant Mobile Access
+              </button>
+              <button onClick={() => handleBulkAction('revoke_mobile')}
+                data-testid="users-bulk-revoke-mobile"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
+                <Smartphone size={12} /> Revoke Mobile Access
+              </button>
+              <button onClick={() => setSelectedIds([])}
+                className="ml-auto p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
+                <X size={14} />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Table */}
+        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[8px] overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full" data-testid="users-table">
+              <thead>
+                <tr className="bg-[#0F0F0F] text-[#A3A3A3] text-xs uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left w-10">
+                    <input type="checkbox" checked={users.length > 0 && selectedIds.length === users.length}
+                      onChange={toggleSelectAll}
+                      className="w-4 h-4 rounded border-[#2D2D2D] bg-[#1A1A1A] text-[#10B981] focus:ring-[#10B981] focus:ring-offset-0" />
+                  </th>
+                  <th className="px-4 py-3 text-left">User</th>
+                  <th className="px-4 py-3 text-left">Email</th>
+                  <th className="px-4 py-3 text-left">Organization</th>
+                  <th className="px-4 py-3 text-left">Department</th>
+                  <th className="px-4 py-3 text-left">Role</th>
+                  <th className="px-4 py-3 text-left">Status</th>
+                  <th className="px-4 py-3 text-left">Mobile App</th>
+                  <th className="px-4 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading ? (
+                  [...Array(5)].map((_, i) => (
+                    <tr key={i} className="border-t border-[#1F1F1F]">
+                      {[...Array(9)].map((_, j) => (
+                        <td key={j} className="px-4 py-4">
+                          <div className="h-4 bg-[#1A1A1A] rounded animate-pulse" style={{ width: `${40 + Math.random() * 50}%` }} />
+                        </td>
+                      ))}
+                    </tr>
+                  ))
+                ) : users.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="px-4 py-16 text-center">
+                      <UsersIcon size={40} className="text-[#A3A3A3]/30 mx-auto mb-3" />
+                      <p className="text-[#A3A3A3] mb-4">No users found</p>
+                    </td>
+                  </tr>
+                ) : (
+                  <AnimatePresence>
+                    {users.map((user, index) => (
+                      <motion.tr
+                        key={user._id}
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: index * 0.04 }}
+                        className="border-t border-[#1F1F1F] hover:bg-[#1A1A1A] transition-colors duration-150"
+                        data-testid="users-table-row"
+                      >
+                        <td className="px-4 py-4">
+                          <input type="checkbox" checked={selectedIds.includes(user._id)}
+                            onChange={() => toggleSelect(user._id)}
+                            className="w-4 h-4 rounded border-[#2D2D2D] bg-[#1A1A1A] text-[#10B981] focus:ring-[#10B981] focus:ring-offset-0" />
+                        </td>
+                        <td className="px-4 py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-xs font-medium flex-shrink-0">
+                              {user.display_name?.charAt(0)?.toUpperCase() || '?'}
+                            </div>
+                            <span className="text-sm font-medium text-[#F5F5F5]">{user.display_name}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-4 text-sm text-[#A3A3A3]">{user.email}</td>
+                        <td className="px-4 py-4 text-sm text-[#F5F5F5]">{user.org_name}</td>
+                        <td className="px-4 py-4 text-sm text-[#F5F5F5]">{user.dept_name}</td>
+                        <td className="px-4 py-4">
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                            user.role === 'admin'
+                              ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30'
+                              : 'bg-[#1A1A1A] text-[#A3A3A3] border border-[#2D2D2D]'
+                          }`}>
+                            {user.role === 'admin' ? 'Admin' : 'Member'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4">
+                          <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${
+                            user.is_active ? 'text-[#10B981]' : 'text-[#EF4444]'
+                          }`}>
+                            <span className={`w-1.5 h-1.5 rounded-full ${user.is_active ? 'bg-[#10B981]' : 'bg-[#EF4444]'}`} />
+                            {user.is_active ? 'Active' : 'Inactive'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4">
+                          <button
+                            onClick={() => toggleMobileAccess(user)}
+                            disabled={mobilePending.includes(user._id)}
+                            data-testid="users-mobile-access-toggle"
+                            title={user.mobile_access
+                              ? 'Approved for the mobile app — click to revoke'
+                              : 'Not approved for the mobile app — click to grant'}
+                            className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium border transition-colors disabled:opacity-50 disabled:cursor-wait ${
+                              user.mobile_access
+                                ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30 hover:bg-[#10B981]/20'
+                                : 'bg-[#1A1A1A] text-[#A3A3A3] border-[#2D2D2D] hover:text-[#F5F5F5] hover:border-[#10B981]/30'
+                            }`}
+                          >
+                            {mobilePending.includes(user._id)
+                              ? <Loader2 size={12} className="animate-spin" />
+                              : <Smartphone size={12} />}
+                            {user.mobile_access ? 'Approved' : 'Not approved'}
+                          </button>
+                        </td>
+                        <td className="px-4 py-4">
+                          <button onClick={() => openEdit(user)} data-testid="users-edit-open-button"
+                            className="p-2 text-[#A3A3A3] hover:text-[#10B981] hover:bg-[#10B981]/10 rounded-[6px] transition-colors">
+                            <Pencil size={14} />
+                          </button>
+                        </td>
+                      </motion.tr>
+                    ))}
+                  </AnimatePresence>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between px-6 py-3 border-t border-[#1F1F1F]">
+              <span className="text-xs text-[#A3A3A3]">
+                Showing {(page - 1) * limit + 1}-{Math.min(page * limit, total)} of {total}
+              </span>
+              <div className="flex items-center gap-1">
+                <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1} className="p-1.5 rounded-[6px] text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                  <ChevronLeft size={16} />
+                </button>
+                {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => i + 1).map(p => (
+                  <button key={p} onClick={() => setPage(p)} className={`w-8 h-8 rounded-[6px] text-xs font-medium transition-colors ${page === p ? 'bg-[#10B981] text-[#0A0A0A]' : 'text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A]'}`}>{p}</button>
+                ))}
+                <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages} className="p-1.5 rounded-[6px] text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Create User Modal */}
+        <AnimatePresence>
+          {showCreate && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center p-4"
+              onClick={() => setShowCreate(false)}>
+              <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+                transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
+                onClick={(e) => e.stopPropagation()}
+                className="relative bg-[#141414] border border-[#1F1F1F] rounded-[8px] w-full max-w-lg shadow-[0_0_0_1px_rgba(31,31,31,1),0_18px_60px_rgba(0,0,0,0.55)] max-h-[85vh] overflow-y-auto"
+              >
+                <div className="p-6">
+                  <h3 className="text-lg font-semibold text-[#F5F5F5] mb-6">Create User</h3>
+                  <div className="space-y-4">
+                    {/* Org select */}
+                    <div>
+                      <span id="users-06-organization" className="text-sm text-[#A3A3A3] mb-1.5 block">Organization *</span>
+                      <div className="relative">
+                        <button aria-labelledby="users-06-organization users-06-organization-value"
+                          aria-expanded={createOrgOpen} onClick={() => { setCreateOrgOpen(!createOrgOpen); setCreateDeptOpen(false); }}
+                          className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
+                          <span id="users-06-organization-value" className={createOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createOrg?.name || 'Select organization'}</span>
+                          <ChevronDown size={14} className="text-[#A3A3A3]" />
+                        </button>
+                        <AnimatePresence>
+                          {createOrgOpen && (
+                            <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }}
+                              className="absolute top-full left-0 right-0 mt-1 bg-[#141414] border border-[#1F1F1F] rounded-[6px] shadow-lg z-30 max-h-48 overflow-y-auto">
+                              {orgs.map(o => (
+                                <button key={o._id} onClick={() => { setCreateOrg(o); setCreateDept(null); setCreateOrgOpen(false); }}
+                                  className={`w-full px-4 py-2.5 text-sm text-left hover:bg-[#1A1A1A] ${createOrg?._id === o._id ? 'text-[#10B981]' : 'text-[#F5F5F5]'}`}>{o.name}</button>
+                              ))}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    </div>
+
+                    {/* Dept select */}
+                    <div>
+                      <span id="users-07-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</span>
+                      <div className="relative">
+                        <button aria-labelledby="users-07-department users-07-department-value"
+                          aria-expanded={createDeptOpen} onClick={() => { if (createOrg) { setCreateDeptOpen(!createDeptOpen); setCreateOrgOpen(false); } }}
+                          className={`w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all ${!createOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}>
+                          <span id="users-07-department-value" className={createDept ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createDept?.name || 'Select department'}</span>
+                          <ChevronDown size={14} className="text-[#A3A3A3]" />
+                        </button>
+                        <AnimatePresence>
+                          {createDeptOpen && (
+                            <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }}
+                              className="absolute top-full left-0 right-0 mt-1 bg-[#141414] border border-[#1F1F1F] rounded-[6px] shadow-lg z-30 max-h-48 overflow-y-auto">
+                              {createDepts.length === 0 ? (
+                                <p className="px-4 py-3 text-sm text-[#A3A3A3]">No departments in this org</p>
+                              ) : createDepts.map(d => (
+                                <button key={d._id} onClick={() => { setCreateDept(d); setCreateDeptOpen(false); }}
+                                  className={`w-full px-4 py-2.5 text-sm text-left hover:bg-[#1A1A1A] ${createDept?._id === d._id ? 'text-[#10B981]' : 'text-[#F5F5F5]'}`}>{d.name}</button>
+                              ))}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    </div>
+
+                    {/* Email */}
+                    <div>
+                      <label htmlFor="users-08-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email *</label>
+                      <input id="users-08-email" type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)}
+                        placeholder="user@company.com" data-testid="user-email-input"
+                        className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all" />
+                      {emailAvailable === false && <p className="mt-1 text-xs text-[#EF4444]">Email already in use</p>}
+                      {emailAvailable === true && <p className="mt-1 text-xs text-[#10B981]">Email available</p>}
+                    </div>
+
+                    {/* Name */}
+                    <div>
+                      <label htmlFor="users-09-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
+                      <input id="users-09-display-name" type="text" value={createName} onChange={(e) => setCreateName(e.target.value)}
+                        maxLength={100}
+                        placeholder="John Doe" data-testid="user-name-input"
+                        className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all" />
+                    </div>
+
+                    {/* Password section */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        {/* Caption for the field, which is what labels the manual
+                            input below. Borrowing it for the switch renamed the
+                            switch "Password" and lost both "Auto-generate" and
+                            whether it is currently on. */}
+                        <span id="users-10-password" className="text-sm text-[#A3A3A3]">Password</span>
+                        <button aria-pressed={autoPassword} onClick={() => setAutoPassword(!autoPassword)} data-testid="users-auto-password-toggle"
+                          className="flex items-center gap-2 text-xs text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
+                          <div className={`w-8 h-4.5 rounded-full transition-colors ${autoPassword ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                            <div className={`absolute top-0.5 w-3.5 h-3.5 rounded-full bg-white transition-transform ${autoPassword ? 'left-4' : 'left-0.5'}`} />
+                          </div>
+                          Auto-generate
+                        </button>
+                      </div>
+                      {autoPassword ? (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm font-mono text-[#10B981] flex items-center"
+                            data-testid="users-generated-password">
+                            {createPassword}
+                          </div>
+                          <button onClick={() => copyToClipboard(createPassword)} data-testid="users-copy-password-button"
+                            className="h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-[#A3A3A3] hover:text-[#10B981] hover:border-[#10B981]/30 transition-colors">
+                            <Copy size={14} />
+                          </button>
+                          <button onClick={() => setCreatePassword(generatePassword())}
+                            className="h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-[#A3A3A3] hover:text-[#10B981] hover:border-[#10B981]/30 transition-colors">
+                            <RefreshCw size={14} />
+                          </button>
+                        </div>
+                      ) : (
+                        <input type="text" value={createPassword} onChange={(e) => setCreatePassword(e.target.value)}
+                          placeholder="Min 6 characters" aria-labelledby="users-10-password"
+                          className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none transition-all" />
+                      )}
+                    </div>
+
+                    {/* Role */}
+                    <div>
+                      {/* A caption for a set of radios, not a control of its own:
+                          the inner <label>s wrap their inputs, so those are already
+                          associated. A second <label> around the group named nothing. */}
+                      <span id="users-create-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</span>
+                      <div role="radiogroup" aria-labelledby="users-create-role" className="space-y-2">
+                        {['member', 'admin'].map(role => (
+                          <label key={role}
+                            className={`flex items-start gap-3 p-3 rounded-[6px] border cursor-pointer transition-colors ${
+                              createRole === role ? 'bg-[#10B981]/5 border-[#10B981]/30' : 'bg-[#1A1A1A] border-[#2D2D2D] hover:border-[#10B981]/20'
+                            }`}>
+                            <input type="radio" name="role" checked={createRole === role}
+                              onChange={() => setCreateRole(role)}
+                              className="mt-0.5 text-[#10B981] focus:ring-[#10B981]" />
+                            <div>
+                              <span className="text-sm text-[#F5F5F5] font-medium capitalize">{role}</span>
+                              {role === 'admin' && (
+                                <p className="text-xs text-[#A3A3A3] mt-0.5">Admins can manage users and departments within this organization</p>
+                              )}
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Mobile app access */}
+                    <div>
+                      <span id="users-12-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</span>
+                      <button aria-labelledby="users-12-mobile-app-access users-12-mobile-app-access-state"
+                        aria-pressed={createMobileAccess} onClick={() => setCreateMobileAccess(!createMobileAccess)}
+                        data-testid="users-create-mobile-access-toggle"
+                        className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
+                        <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${createMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                          <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all"
+                            style={{ left: createMobileAccess ? '22px' : '2px' }} />
+                        </div>
+                        <div className="min-w-0">
+                          {/* The state line is the name: a toggle called only
+                              "Mobile App Access" sounds the same granted or not. */}
+                          <span id="users-12-mobile-app-access-state" className={`text-sm flex items-center gap-1.5 ${createMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                            <Smartphone size={13} />
+                            {createMobileAccess ? 'Allow mobile sign-in' : 'Web only'}
+                          </span>
+                          <p className="text-xs text-[#A3A3A3] mt-0.5">
+                            Mobile access is off by default and can be changed at any time.
+                          </p>
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[#1F1F1F]">
+                  <button onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">Cancel</button>
+                  <button onClick={handleCreateUser}
+                    disabled={!createOrg || !createDept || !createEmail || createName.trim().length < 2 || !createPassword || createPassword.length < 6 || emailAvailable === false || createSaving}
+                    data-testid="user-create-submit"
+                    className="px-4 py-2 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2">
+                    {createSaving && <Loader2 size={14} className="animate-spin" />}
+                    Create User
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Edit User Drawer (slides from right) */}
+        <AnimatePresence>
+          {editUser && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50" onClick={() => { setEditUser(null); setResetPwResult(null); }}>
+              <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
+              <motion.div
+                initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
+                transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
+                onClick={(e) => e.stopPropagation()}
+                data-testid="users-edit-drawer"
+                className="absolute right-0 top-0 h-full w-full sm:w-[420px] bg-[#141414] border-l border-[#1F1F1F] shadow-2xl overflow-y-auto"
+              >
+                <div className="p-6">
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="text-lg font-semibold text-[#F5F5F5]">Edit User</h3>
+                    <button onClick={() => { setEditUser(null); setResetPwResult(null); }}
+                      className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">
+                      <X size={18} />
+                    </button>
+                  </div>
+
+                  {/* User info header */}
+                  <div className="flex items-center gap-3 mb-6 p-3 bg-[#0F0F0F] rounded-[8px]">
+                    <div className="w-10 h-10 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] font-medium">
+                      {editUser.display_name?.charAt(0)?.toUpperCase()}
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-[#F5F5F5]">{editUser.display_name}</p>
+                      <p className="text-xs text-[#A3A3A3]">{editUser.email}</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-5">
+                    {/* Display name */}
+                    <div>
+                      <label htmlFor="users-13-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name</label>
+                      <input id="users-13-display-name" type="text" value={editName} onChange={(e) => setEditName(e.target.value)}
+                        maxLength={100}
+                        className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none transition-all" />
+                    </div>
+
+                    {/* Email (read-only) */}
+                    <div>
+                      <label htmlFor="users-14-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
+                      <input id="users-14-email" type="email" value={editUser.email} readOnly
+                        className="w-full h-10 px-4 bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] text-sm text-[#A3A3A3] cursor-not-allowed" />
+                    </div>
+
+                    {/* Department */}
+                    <div>
+                      <span id="users-15-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department</span>
+                      <div className="relative">
+                        <button aria-labelledby="users-15-department users-15-department-value"
+                          aria-expanded={editDeptOpen} onClick={() => setEditDeptOpen(!editDeptOpen)}
+                          className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
+                          <span id="users-15-department-value" className="text-[#F5F5F5]">{editDepts.find(d => d._id === editDeptId)?.name || editUser.dept_name}</span>
+                          <ChevronDown size={14} className="text-[#A3A3A3]" />
+                        </button>
+                        <AnimatePresence>
+                          {editDeptOpen && (
+                            <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }}
+                              className="absolute top-full left-0 right-0 mt-1 bg-[#141414] border border-[#1F1F1F] rounded-[6px] shadow-lg z-20 max-h-48 overflow-y-auto">
+                              {editDepts.map(d => (
+                                <button key={d._id} onClick={() => { setEditDeptId(d._id); setEditDeptOpen(false); }}
+                                  className={`w-full px-4 py-2.5 text-sm text-left hover:bg-[#1A1A1A] ${editDeptId === d._id ? 'text-[#10B981]' : 'text-[#F5F5F5]'}`}>{d.name}</button>
+                              ))}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    </div>
+
+                    {/* Role */}
+                    <div>
+                      <span id="users-16-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</span>
+                      <div role="group" aria-labelledby="users-16-role" className="flex gap-2">
+                        {['member', 'admin'].map(role => (
+                          <button key={role} aria-pressed={editRole === role} onClick={() => setEditRole(role)}
+                            className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
+                              editRole === role ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'
+                            }`}>
+                            {role}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Status */}
+                    <div>
+                      <span id="users-17-status" className="text-sm text-[#A3A3A3] mb-2 block">Status</span>
+                      <button aria-labelledby="users-17-status users-17-status-state"
+                        aria-pressed={editActive} onClick={() => setEditActive(!editActive)}
+                        className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors">
+                        <div className={`w-10 h-5 rounded-full transition-colors ${editActive ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                          <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${editActive ? 'left-5.5' : 'left-0.5'}`}
+                            style={{ left: editActive ? '22px' : '2px' }} />
+                        </div>
+                        <span id="users-17-status-state" className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>
+                          {editActive ? 'Active' : 'Inactive'}
+                        </span>
+                      </button>
+                    </div>
+
+                    {/* Mobile app access — the super-admin-only grant. Spelled out
+                        rather than labelled with a bare toggle, because "off" here
+                        is the reason a user's app says it cannot sign them in. */}
+                    <div>
+                      <span id="users-18-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</span>
+                      <button aria-labelledby="users-18-mobile-app-access users-18-mobile-app-access-state"
+                        aria-pressed={editMobileAccess} onClick={() => setEditMobileAccess(!editMobileAccess)}
+                        data-testid="users-edit-mobile-access-toggle"
+                        className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
+                        <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${editMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                          <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all"
+                            style={{ left: editMobileAccess ? '22px' : '2px' }} />
+                        </div>
+                        <div className="min-w-0">
+                          <span id="users-18-mobile-app-access-state" className={`text-sm flex items-center gap-1.5 ${editMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                            <Smartphone size={13} />
+                            {editMobileAccess ? 'Approved for mobile' : 'Web only'}
+                          </span>
+                          <p className="text-xs text-[#A3A3A3] mt-0.5">
+                            {editMobileAccess
+                              ? 'This user can sign in to the RxHive iOS app.'
+                              : 'This user cannot sign in to the RxHive iOS app.'}
+                          </p>
+                        </div>
+                      </button>
+                      {editUser.mobile_access && !editMobileAccess && (
+                        <p className="mt-2 text-xs text-[#F59E0B]">
+                          Saving will sign this user out of the mobile app. Their web session is unaffected.
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Reset Password */}
+                    <div className="pt-2">
+                      <button onClick={handleResetPassword} data-testid="users-reset-password-button"
+                        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium bg-[#1A1A1A] border border-[#2D2D2D] text-[#F59E0B] hover:bg-[#F59E0B]/10 hover:border-[#F59E0B]/30 transition-colors">
+                        <RefreshCw size={14} />
+                        Reset Password
+                      </button>
+                      {resetPwResult && (
+                        <div className="mt-2 p-3 bg-[#10B981]/5 border border-[#10B981]/20 rounded-[6px]">
+                          <p className="text-xs text-[#A3A3A3] mb-1">Temporary password:</p>
+                          <div className="flex items-center gap-2">
+                            <code className="flex-1 text-sm font-mono text-[#10B981]">{resetPwResult}</code>
+                            <button onClick={() => copyToClipboard(resetPwResult)}
+                              className="p-1.5 text-[#A3A3A3] hover:text-[#10B981] transition-colors">
+                              <Copy size={14} />
+                            </button>
+                          </div>
+                          <p data-testid="users-reset-password-next-step" className="mt-2 text-xs text-[#A3A3A3]">
+                            Give this to the user. They will be asked to choose a new password the next time they sign in.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Save/Cancel */}
+                  <div className="flex items-center gap-3 mt-8">
+                    <button onClick={() => { setEditUser(null); setResetPwResult(null); }}
+                      className="flex-1 px-4 py-2.5 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] transition-colors">
+                      Cancel
+                    </button>
+                    <button onClick={handleEditSave} disabled={editSaving || editName.trim().length < 2} data-testid="users-edit-save-button"
+                      className="flex-1 px-4 py-2.5 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2">
+                      {editSaving && <Loader2 size={14} className="animate-spin" />}
+                      Save Changes
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </PageTransition>
+  );
+}
